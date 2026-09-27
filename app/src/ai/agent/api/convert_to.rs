@@ -495,9 +495,9 @@ fn convert_input_to_user_input(
                 },
             ),
         ),
-        AIAgentInput::AgentMessageWake => Ok(
-            api::request::input::user_inputs::user_input::Input::AgentMessageWake(
-                api::request::input::user_inputs::AgentMessageWake {},
+        AIAgentInput::AgentWake => Ok(
+            api::request::input::user_inputs::user_input::Input::AgentWake(
+                api::request::input::user_inputs::AgentWake {},
             ),
         ),
         AIAgentInput::ResumeConversation { .. } => Err(ConvertToAPITypeError::Ignore),

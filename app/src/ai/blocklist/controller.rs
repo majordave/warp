@@ -1269,7 +1269,7 @@ impl BlocklistAIController {
             .as_ref()
             .is_some_and(BaseUserQuery::is_agent_message_wake)
         {
-            return self.send_agent_message_wake(conversation_id, participant_id, ctx);
+            return self.send_agent_wake(conversation_id, participant_id, ctx);
         }
 
         // Ensure we capture all pending context blocks before promoting and attaching them to the conversation.
@@ -1385,8 +1385,8 @@ impl BlocklistAIController {
         true
     }
 
-    /// Sends an agent-message wake on the conversation's root task.
-    fn send_agent_message_wake(
+    /// Sends an agent wake on the conversation's root task.
+    fn send_agent_wake(
         &mut self,
         conversation_id: AIConversationId,
         participant_id: Option<ParticipantId>,
@@ -1396,7 +1396,7 @@ impl BlocklistAIController {
             BlocklistAIHistoryModel::as_ref(ctx).conversation(&conversation_id)
         else {
             report_error!(
-                "Tried to send an agent-message wake for a non-existent conversation",
+                "Tried to send an agent wake for a non-existent conversation",
                 extra: { "conversation_id" => ?conversation_id }
             );
             return false;
@@ -1409,7 +1409,7 @@ impl BlocklistAIController {
                     task_id,
                 },
                 input_query: InputQueryType::AIInputType {
-                    ai_input: AIAgentInput::AgentMessageWake,
+                    ai_input: AIAgentInput::AgentWake,
                 },
                 additional_attachments: HashMap::new(),
                 queued_query_id: None,
@@ -1755,7 +1755,7 @@ impl BlocklistAIController {
             .base_user_query()
             .is_some_and(BaseUserQuery::is_agent_message_wake)
         {
-            AIAgentInput::AgentMessageWake
+            AIAgentInput::AgentWake
         } else {
             input_for_query(
                 row.text().to_owned(),

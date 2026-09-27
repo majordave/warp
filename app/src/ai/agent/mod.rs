@@ -3010,9 +3010,9 @@ pub enum AIAgentInput {
         status: OrchestrationConfigStatus,
     },
 
-    /// Wakes the run because agent messages may be waiting. Carries no content: the server
-    /// supplies any pending messages itself.
-    AgentMessageWake,
+    /// Reports that the run was woken; the server injects any pending agent messages into the
+    /// turn.
+    AgentWake,
 }
 
 /// Data for a single message received by an agent from another agent.
@@ -3106,7 +3106,7 @@ impl Display for AIAgentInput {
             }
             Self::PassiveSuggestionResult { .. } => write!(f, "PassiveSuggestionResult"),
             Self::OrchestrationConfigUpdate { .. } => write!(f, "OrchestrationConfigUpdate"),
-            Self::AgentMessageWake => write!(f, "AgentMessageWake"),
+            Self::AgentWake => write!(f, "AgentWake"),
         }
     }
 }
@@ -3169,7 +3169,7 @@ impl AIAgentInput {
             | Self::EventsFromAgents { .. }
             | Self::PassiveSuggestionResult { .. }
             | Self::OrchestrationConfigUpdate { .. }
-            | Self::AgentMessageWake => None,
+            | Self::AgentWake => None,
         }
     }
 
@@ -3275,7 +3275,7 @@ impl AIAgentInput {
             Self::MessagesReceivedFromAgents { .. }
             | Self::EventsFromAgents { .. }
             | Self::OrchestrationConfigUpdate { .. }
-            | Self::AgentMessageWake => None,
+            | Self::AgentWake => None,
         }
     }
 
@@ -3307,7 +3307,7 @@ impl AIAgentInput {
             | Self::EventsFromAgents { .. }
             | Self::PassiveSuggestionResult { .. }
             | Self::OrchestrationConfigUpdate { .. }
-            | Self::AgentMessageWake => None,
+            | Self::AgentWake => None,
         }
     }
 

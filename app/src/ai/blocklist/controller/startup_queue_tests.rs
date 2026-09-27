@@ -310,7 +310,7 @@ fn startup_injections_queued_before_the_initial_prompt_are_dispatched_one_at_a_t
     });
 }
 
-/// The fallback text the server sends with an agent-message wake.
+/// The fallback text the server sends with an agent wake.
 const WAKE_PROMPT: &str = "You have received new agent messages. Read all unread agent messages.";
 
 /// A base whose origin is the server's agent-message wake.
@@ -337,8 +337,8 @@ fn assert_wake_sent_as_input_not_query(history: &BlocklistAIHistoryModel, id: AI
     assert!(
         inputs
             .iter()
-            .any(|input| matches!(input, AIAgentInput::AgentMessageWake)),
-        "expected an AgentMessageWake input among: {inputs:?}"
+            .any(|input| matches!(input, AIAgentInput::AgentWake)),
+        "expected an AgentWake input among: {inputs:?}"
     );
     assert!(
         user_queries_in_order(history, id)
@@ -349,7 +349,7 @@ fn assert_wake_sent_as_input_not_query(history: &BlocklistAIHistoryModel, id: AI
 }
 
 #[test]
-fn agent_message_wake_origin_becomes_an_agent_message_wake_input_not_a_query() {
+fn agent_message_wake_origin_becomes_an_agent_wake_input_not_a_query() {
     // The wake must be recognized even when it arrives through the startup-injection queue.
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
@@ -488,8 +488,8 @@ fn wake_text_without_the_wake_origin_stays_a_user_query() {
                 assert!(
                     !inputs
                         .iter()
-                        .any(|input| matches!(input, AIAgentInput::AgentMessageWake)),
-                    "no AgentMessageWake input expected among: {inputs:?}"
+                        .any(|input| matches!(input, AIAgentInput::AgentWake)),
+                    "no AgentWake input expected among: {inputs:?}"
                 );
                 assert_eq!(
                     user_queries_in_order(history, id),

@@ -91,7 +91,7 @@ pub(crate) fn redact_inputs(inputs: &mut [AIAgentInput]) {
             AIAgentInput::MessagesReceivedFromAgents { .. }
             | AIAgentInput::EventsFromAgents { .. }
             | AIAgentInput::OrchestrationConfigUpdate { .. }
-            | AIAgentInput::AgentMessageWake => {}
+            | AIAgentInput::AgentWake => {}
             AIAgentInput::ActionResult { result, context } => {
                 redact_context(Arc::make_mut(context));
                 match &mut result.result {
