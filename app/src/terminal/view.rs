@@ -478,8 +478,7 @@ use crate::terminal::shared_session::{
     SharedSessionStatus,
 };
 use crate::terminal::shell_recovery::{
-    CloudShellRecoveryDecision, CloudShellRecoveryEligibility, CloudShellRecoveryRequest,
-    recovered_command_output,
+    CloudShellRecoveryRequest, MAX_CLOUD_SHELL_RECOVERIES, recovered_command_output,
 };
 use crate::terminal::view::block_onboarding::onboarding_prompt_block::OnboardingPromptBlock;
 use crate::terminal::view::init_environment::mode_selector::{
@@ -2980,9 +2979,6 @@ pub struct TerminalView {
     manual_pty_shutdown_requested: bool,
     cloud_shell_recovery_count: u8,
     pending_cloud_shell_recovery: Option<CloudShellRecoveryRequest>,
-    cloud_shell_recovery_terminal_failure: bool,
-    #[cfg(feature = "integration_tests")]
-    cloud_shell_recovery_integration_action: Option<(AIConversationId, AIAgentActionId)>,
 
     ephemeral_message_model: ModelHandle<EphemeralMessageModel>,
 
@@ -4536,9 +4532,6 @@ impl TerminalView {
             manual_pty_shutdown_requested: false,
             cloud_shell_recovery_count: 0,
             pending_cloud_shell_recovery: None,
-            cloud_shell_recovery_terminal_failure: false,
-            #[cfg(feature = "integration_tests")]
-            cloud_shell_recovery_integration_action: None,
             first_time_cloud_agent_setup_view,
             cloud_agent_team_required_view,
             environment_setup_mode_selector,
@@ -5224,28 +5217,6 @@ impl TerminalView {
                     | ContextChipKind::GithubPullRequest
             )
         })
-    }
-
-    fn cloud_shell_recovery_decision(&self, ctx: &ViewContext<Self>) -> CloudShellRecoveryDecision {
-        let model = self.model.lock();
-        CloudShellRecoveryEligibility {
-            feature_enabled: FeatureFlag::CloudAgentShellRespawn.is_enabled(),
-            manual_shutdown_requested: self.manual_pty_shutdown_requested,
-            recovery_in_progress: self.pending_cloud_shell_recovery.is_some(),
-            terminal_failure: self.cloud_shell_recovery_terminal_failure,
-            recovery_count: self.cloud_shell_recovery_count,
-            login_shell_bootstrapped: self.is_login_shell_bootstrapped,
-            third_party_harness: self
-                .ambient_agent_view_model
-                .as_ref()
-                .is_some_and(|ambient| ambient.as_ref(ctx).is_third_party_harness()),
-            shared_ambient_session: model.is_shared_ambient_agent_session(),
-            active_sharer: model.shared_session_status().is_active_sharer(),
-            running_environment_setup: model
-                .block_list()
-                .is_executing_oz_environment_startup_commands(),
-        }
-        .decision()
     }
 
     /// Returns whether visible prompt/footer chips need git status updates.
@@ -7659,47 +7630,6 @@ impl TerminalView {
                 ctx,
             );
         });
-    }
-
-    #[cfg(feature = "integration_tests")]
-    pub fn cloud_shell_recovery_state_for_integration_test(&self) -> (u8, bool, bool, bool) {
-        let model = self.model.lock();
-        (
-            self.cloud_shell_recovery_count,
-            self.pending_cloud_shell_recovery.is_some(),
-            model.shared_session_status().is_active_sharer(),
-            model.is_shared_ambient_agent_session(),
-        )
-    }
-
-    #[cfg(feature = "integration_tests")]
-    pub fn cloud_shell_recovery_result_for_integration_test(
-        &self,
-        ctx: &AppContext,
-    ) -> Option<(
-        usize,
-        warp_multi_agent_api::request::input::tool_call_result::Result,
-    )> {
-        let (conversation_id, action_id) = self.cloud_shell_recovery_integration_action.as_ref()?;
-        let results = self
-            .ai_action_model
-            .as_ref(ctx)
-            .get_finished_action_results(*conversation_id)?;
-        let matching_results = results
-            .iter()
-            .filter(|result| &result.id == action_id)
-            .collect_vec();
-        let result = matching_results.first()?;
-        let AIAgentActionResultType::RequestCommandOutput(result) = &result.result else {
-            return None;
-        };
-        Some((
-            matching_results.len(),
-            warp_multi_agent_api::request::input::tool_call_result::Result::try_from(
-                result.clone(),
-            )
-            .ok()?,
-        ))
     }
 
     fn update_context_blocks_and_exchanges(&mut self, ctx: &mut ViewContext<Self>) {
@@ -12025,7 +11955,6 @@ impl TerminalView {
                 })
             })?;
         let action_id = block.requested_command_action_id()?.clone();
-        let conversation_id = block.ai_conversation_id()?;
         let requested_working_directory = self
             .active_block_metadata
             .as_ref()
@@ -12043,7 +11972,6 @@ impl TerminalView {
 
         Some(CloudShellRecoveryRequest {
             action_id,
-            conversation_id,
             block_id: block.id().clone(),
             partial_output: block.output_with_secrets_unobfuscated(),
             status,
@@ -12061,46 +11989,33 @@ impl TerminalView {
         status: ObservedExitStatus,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
-        let attempt = match self.cloud_shell_recovery_decision(ctx) {
-            CloudShellRecoveryDecision::Attempt(attempt) => attempt,
-            CloudShellRecoveryDecision::Capped => {
-                let attempt = self.cloud_shell_recovery_count + 1;
-                let Some(request) = self.cloud_shell_recovery_request(status, attempt, ctx) else {
-                    return false;
-                };
-                Self::send_cloud_shell_recovery_telemetry(
-                    CloudAgentShellRecoveryOutcome::Detected,
-                    &request,
-                    None,
-                    None,
-                    None,
-                    ctx,
-                );
-                Self::send_cloud_shell_recovery_telemetry(
-                    CloudAgentShellRecoveryOutcome::Exhausted,
-                    &request,
-                    Some(0),
-                    None,
-                    None,
-                    ctx,
-                );
+        if !FeatureFlag::CloudAgentShellRespawn.is_enabled()
+            || self.manual_pty_shutdown_requested
+            || self.pending_cloud_shell_recovery.is_some()
+            || !self.is_login_shell_bootstrapped
+            || self
+                .ambient_agent_view_model
+                .as_ref()
+                .is_some_and(|ambient| ambient.as_ref(ctx).is_third_party_harness())
+        {
+            return false;
+        }
+        {
+            let model = self.model.lock();
+            if model.is_read_only()
+                || !model.is_shared_ambient_agent_session()
+                || !model.shared_session_status().is_active_sharer()
+                || model
+                    .block_list()
+                    .is_executing_oz_environment_startup_commands()
+            {
                 return false;
             }
-            CloudShellRecoveryDecision::Ineligible => return false,
-        };
+        }
+        let attempt = self.cloud_shell_recovery_count + 1;
         let Some(request) = self.cloud_shell_recovery_request(status, attempt, ctx) else {
             return false;
         };
-        let shell_command_executor = self.ai_action_model.as_ref(ctx).shell_command_executor(ctx);
-        let accepted = shell_command_executor.update(ctx, |executor, _| {
-            executor.begin_shell_recovery(&request.action_id, &request.block_id)
-        });
-        if !accepted {
-            return false;
-        }
-
-        self.cloud_shell_recovery_count = request.attempt;
-        self.pending_cloud_shell_recovery = Some(request.clone());
         Self::send_cloud_shell_recovery_telemetry(
             CloudAgentShellRecoveryOutcome::Detected,
             &request,
@@ -12109,6 +12024,25 @@ impl TerminalView {
             None,
             ctx,
         );
+        if attempt > MAX_CLOUD_SHELL_RECOVERIES {
+            Self::send_cloud_shell_recovery_telemetry(
+                CloudAgentShellRecoveryOutcome::Exhausted,
+                &request,
+                Some(0),
+                None,
+                None,
+                ctx,
+            );
+            return false;
+        }
+        self.ai_action_model
+            .as_ref(ctx)
+            .shell_command_executor(ctx)
+            .update(ctx, |executor, _| {
+                executor.begin_shell_recovery(&request.action_id, &request.block_id);
+            });
+        self.cloud_shell_recovery_count = attempt;
+        self.pending_cloud_shell_recovery = Some(request.clone());
         Self::send_cloud_shell_recovery_telemetry(
             CloudAgentShellRecoveryOutcome::Started,
             &request,
@@ -12149,7 +12083,6 @@ impl TerminalView {
             Some(failure_class),
             ctx,
         );
-        self.cloud_shell_recovery_terminal_failure = true;
         self.model
             .lock()
             .finalize_exit(ExitReason::ShellProcessExited {
@@ -24106,46 +24039,6 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) -> ViewHandle<AIBlock> {
         self.insert_dummy_ai_block_internal(query, DummyAIBlockOutput::Streaming, ctx)
-    }
-
-    #[cfg(feature = "integration_tests")]
-    pub fn execute_cloud_shell_recovery_command_for_integration_test(
-        &mut self,
-        command: String,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        use crate::ai::agent::task::TaskId;
-        use crate::ai::agent::{AIAgentAction, AIAgentActionId, AIAgentActionType};
-
-        let terminal_view_id = ctx.view_id();
-        let conversation_id = BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-            let conversation_id =
-                history.start_new_conversation(terminal_view_id, false, false, false, ctx);
-            history.set_active_conversation_id(conversation_id, terminal_view_id, ctx);
-            conversation_id
-        });
-        let action_id = AIAgentActionId::from(format!("shell-recovery-{conversation_id}"));
-        self.cloud_shell_recovery_integration_action = Some((conversation_id, action_id.clone()));
-        self.ai_action_model.update(ctx, |model, ctx| {
-            model.queue_action_for_integration_test(
-                AIAgentAction {
-                    id: action_id,
-                    task_id: TaskId::new(format!("shell-recovery-{conversation_id}")),
-                    action: AIAgentActionType::RequestCommandOutput {
-                        command,
-                        is_read_only: Some(false),
-                        is_risky: Some(false),
-                        wait_until_completion: true,
-                        uses_pager: Some(false),
-                        rationale: None,
-                        citations: Vec::new(),
-                    },
-                    requires_result: true,
-                },
-                conversation_id,
-                ctx,
-            );
-        });
     }
 
     /// Inserts a dummy AI block whose stream was cancelled while a `run_agents`

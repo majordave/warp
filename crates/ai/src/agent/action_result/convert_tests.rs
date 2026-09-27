@@ -134,22 +134,6 @@ fn recovered_signal_and_unavailable_omit_wire_exit_code() {
 }
 
 #[test]
-fn recovered_observed_zero_is_explicit_in_stable_output() {
-    let result =
-        converted_recovered_command(ObservedExitStatus::Code(0), "Observed status: exit code 0");
-
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(result.output, "Observed status: exit code 0");
-    assert!(!result.encode_to_vec().contains(&0x10));
-    let read_result = converted_read_recovered_command(
-        ObservedExitStatus::Code(0),
-        "Observed status: exit code 0",
-    );
-    assert_eq!(read_result.output, "Observed status: exit code 0");
-    assert!(!read_result.encode_to_vec().contains(&0x10));
-}
-
-#[test]
 fn recovered_nonzero_exit_code_is_serialized() {
     let result = converted_recovered_command(ObservedExitStatus::Code(42), "");
 

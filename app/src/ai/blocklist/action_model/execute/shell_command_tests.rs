@@ -1,19 +1,20 @@
 use std::sync::Arc;
 
 use async_channel::unbounded;
+use futures_lite::future::poll_once;
 use parking_lot::FairMutex;
 use warp_terminal::event::ObservedExitStatus;
 use warpui::{App, EntityId, ModelHandle};
 
 use super::{
     ActionResult, AnyActionExecution, BlockSelector, BlockWaitEvent, ExecuteActionInput,
-    ShellCommandExecutor, ShellRecoveryResult, action_result_for_read_shell_command_output,
+    ShellCommandExecutor, ShellRecoveryResult,
 };
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
     AIAgentAction, AIAgentActionId, AIAgentActionResultType, AIAgentActionType,
-    ReadShellCommandOutputResult, ShellCommandDelay,
+    ReadShellCommandOutputResult, ShellCommandDelay, ShellCommandError,
 };
 use crate::terminal::event::{BlockMetadataReceivedEvent, BlockWorkingDirectoryUpdatedEvent};
 use crate::terminal::model::block::{BlockId, BlockMetadata};
@@ -21,7 +22,12 @@ use crate::terminal::model::session::Sessions;
 use crate::terminal::model::session::active_session::ActiveSession;
 use crate::terminal::model::terminal_model::{BlockIndex, TerminalModel};
 use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
-fn shell_command_executor(app: &mut App) -> ModelHandle<ShellCommandExecutor> {
+fn shell_command_executor(
+    app: &mut App,
+) -> (
+    ModelHandle<ShellCommandExecutor>,
+    ModelHandle<ModelEventDispatcher>,
+) {
     let terminal_view_id = EntityId::new();
     let sessions = app.add_model(|_| Sessions::new_for_test());
     let (_model_events_tx, model_events_rx) = unbounded();
@@ -30,7 +36,7 @@ fn shell_command_executor(app: &mut App) -> ModelHandle<ShellCommandExecutor> {
     let active_session =
         app.add_model(|ctx| ActiveSession::new(sessions, model_event_dispatcher.clone(), ctx));
     let terminal_model = Arc::new(FairMutex::new(TerminalModel::mock(None, None)));
-    app.add_model(|ctx| {
+    let executor = app.add_model(|ctx| {
         ShellCommandExecutor::new(
             active_session,
             terminal_model,
@@ -38,7 +44,8 @@ fn shell_command_executor(app: &mut App) -> ModelHandle<ShellCommandExecutor> {
             terminal_view_id,
             ctx,
         )
-    })
+    });
+    (executor, model_event_dispatcher)
 }
 
 fn read_shell_command_output(
@@ -74,13 +81,13 @@ fn read_shell_command_output(
 #[test]
 fn shell_recovery_persists_result_until_later_read_and_consumes_it_once() {
     App::test((), |mut app| async move {
-        let executor = shell_command_executor(&mut app);
+        let (executor, _dispatcher) = shell_command_executor(&mut app);
         let action_id: AIAgentActionId = "recover-after-snapshot".to_owned().into();
         let block_id = BlockId::new();
 
-        assert!(executor.update(&mut app, |executor, _| {
-            executor.begin_shell_recovery(&action_id, &block_id)
-        }));
+        executor.update(&mut app, |executor, _| {
+            executor.begin_shell_recovery(&action_id, &block_id);
+        });
         executor.update(&mut app, |executor, _| {
             executor.finish_shell_recovery(ShellRecoveryResult {
                 block_id: block_id.clone(),
@@ -106,7 +113,7 @@ fn shell_recovery_persists_result_until_later_read_and_consumes_it_once() {
         assert!(matches!(
             read_shell_command_output(&executor, &block_id, &mut app),
             AIAgentActionResultType::ReadShellCommandOutput(ReadShellCommandOutputResult::Error(
-                crate::ai::agent::ShellCommandError::BlockNotFound
+                ShellCommandError::BlockNotFound
             ))
         ));
     });
@@ -190,59 +197,35 @@ fn block_working_directory_updated_does_not_drain_finish_senders() {
 }
 
 #[test]
-fn shell_recovery_rebinds_requested_command_waiter() {
+fn shell_recovery_waits_through_bootstrap_before_resolving_follow_up_read() {
     App::test((), |mut app| async move {
-        let executor = shell_command_executor(&mut app);
+        let (executor, dispatcher) = shell_command_executor(&mut app);
         let action_id: AIAgentActionId = "recover-shell".to_owned().into();
         let block_id = BlockId::new();
-        let selector = BlockSelector::RequestedCommandId(action_id.clone());
-        let (tx, rx) = async_channel::bounded(2);
-        executor.update(&mut app, |executor, _| {
-            executor.block_finished_senders.insert(selector, tx);
-        });
-
-        assert!(executor.update(&mut app, |executor, _| {
-            executor.begin_shell_recovery(&action_id, &block_id)
+        let mut result = Box::pin(executor.update(&mut app, |executor, ctx| {
+            executor.action_result_future(
+                BlockSelector::Id(block_id.clone()),
+                Some(ShellCommandDelay::OnCompletion),
+                ctx,
+            )
         }));
-        assert!(matches!(rx.try_recv(), Ok(BlockWaitEvent::RecoveryStarted)));
 
         executor.update(&mut app, |executor, _| {
-            executor.finish_shell_recovery(ShellRecoveryResult {
-                block_id: block_id.clone(),
-                output: "replacement ready".to_owned(),
-                status: ObservedExitStatus::Signal(9),
-                restored_working_directory: "/home/agent".to_owned(),
-                used_fallback_directory: true,
-                start_ts: None,
-                completed_ts: None,
-            });
+            executor.begin_shell_recovery(&action_id, &block_id);
         });
-        let BlockWaitEvent::Recovered(result) =
-            rx.try_recv().expect("recovery result should be delivered")
-        else {
-            panic!("expected recovered shell result");
-        };
-        assert_eq!(result.block_id, block_id);
-        assert_eq!(result.status, ObservedExitStatus::Signal(9));
-    });
-}
+        assert!(poll_once(&mut result).await.is_none());
 
-#[test]
-fn shell_recovery_rebinds_follow_up_read_waiter_after_initial_snapshot() {
-    App::test((), |mut app| async move {
-        let executor = shell_command_executor(&mut app);
-        let action_id: AIAgentActionId = "recover-shell".to_owned().into();
-        let block_id = BlockId::new();
-        let selector = BlockSelector::Id(block_id.clone());
-        let (tx, rx) = async_channel::bounded(2);
-        executor.update(&mut app, |executor, _| {
-            executor.block_finished_senders.insert(selector, tx);
+        dispatcher.update(&mut app, |_, ctx| {
+            ctx.emit(ModelEvent::BlockMetadataReceived(
+                BlockMetadataReceivedEvent {
+                    block_metadata: BlockMetadata::new(None, Some("/worktree".to_owned())),
+                    block_index: BlockIndex::zero(),
+                    is_after_in_band_command: false,
+                    is_done_bootstrapping: true,
+                },
+            ));
         });
-
-        assert!(executor.update(&mut app, |executor, _| {
-            executor.begin_shell_recovery(&action_id, &block_id)
-        }));
-        assert!(matches!(rx.try_recv(), Ok(BlockWaitEvent::RecoveryStarted)));
+        assert!(poll_once(&mut result).await.is_none());
 
         executor.update(&mut app, |executor, _| {
             executor.finish_shell_recovery(ShellRecoveryResult {
@@ -255,91 +238,16 @@ fn shell_recovery_rebinds_follow_up_read_waiter_after_initial_snapshot() {
                 completed_ts: None,
             });
         });
-        let BlockWaitEvent::Recovered(result) = rx
-            .try_recv()
-            .expect("follow-up read should receive recovery")
-        else {
+        let ActionResult::ShellRecovered(result) = result.await else {
             panic!("expected recovered shell result");
         };
         assert_eq!(result.block_id, block_id);
         assert_eq!(result.status, ObservedExitStatus::Code(7));
-    });
-}
-
-#[test]
-fn shell_recovery_resolves_exactly_one_matching_waiter() {
-    App::test((), |mut app| async move {
-        let executor = shell_command_executor(&mut app);
-        let action_id: AIAgentActionId = "recover-shell".to_owned().into();
-        let block_id = BlockId::new();
-        let (requested_tx, requested_rx) = async_channel::bounded(2);
-        let (read_tx, read_rx) = async_channel::bounded(2);
-        executor.update(&mut app, |executor, _| {
-            executor.block_finished_senders.insert(
-                BlockSelector::RequestedCommandId(action_id.clone()),
-                requested_tx,
-            );
-            executor
-                .block_finished_senders
-                .insert(BlockSelector::Id(block_id.clone()), read_tx);
-        });
-
-        assert!(executor.update(&mut app, |executor, _| {
-            executor.begin_shell_recovery(&action_id, &block_id)
-        }));
         assert!(matches!(
-            requested_rx.try_recv(),
-            Ok(BlockWaitEvent::RecoveryStarted)
+            read_shell_command_output(&executor, &block_id, &mut app),
+            AIAgentActionResultType::ReadShellCommandOutput(ReadShellCommandOutputResult::Error(
+                ShellCommandError::BlockNotFound
+            ))
         ));
-        assert!(read_rx.try_recv().is_err());
-
-        executor.update(&mut app, |executor, _| {
-            executor.finish_shell_recovery(ShellRecoveryResult {
-                block_id,
-                output: "replacement ready".to_owned(),
-                status: ObservedExitStatus::Unavailable,
-                restored_working_directory: "/home/agent".to_owned(),
-                used_fallback_directory: true,
-                start_ts: None,
-                completed_ts: None,
-            });
-        });
-        assert!(matches!(
-            requested_rx.try_recv(),
-            Ok(BlockWaitEvent::Recovered(_))
-        ));
-        assert!(read_rx.try_recv().is_err());
     });
-}
-
-#[test]
-fn shell_recovery_follow_up_read_returns_stable_recovery_output() {
-    let block_id = BlockId::new();
-    let result = action_result_for_read_shell_command_output(
-        "exit 7".to_owned(),
-        ActionResult::ShellRecovered(ShellRecoveryResult {
-            block_id: block_id.clone(),
-            output: "replacement ready".to_owned(),
-            status: ObservedExitStatus::Code(7),
-            restored_working_directory: "/worktree".to_owned(),
-            used_fallback_directory: false,
-            start_ts: None,
-            completed_ts: None,
-        }),
-    );
-
-    let AIAgentActionResultType::ReadShellCommandOutput(
-        ReadShellCommandOutputResult::ShellRecovered {
-            block_id: recovered_block_id,
-            output,
-            status,
-            ..
-        },
-    ) = result
-    else {
-        panic!("expected recovered follow-up read result");
-    };
-    assert_eq!(recovered_block_id, block_id);
-    assert_eq!(output, "replacement ready");
-    assert_eq!(status, ObservedExitStatus::Code(7));
 }

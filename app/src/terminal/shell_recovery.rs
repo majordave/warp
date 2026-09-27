@@ -6,58 +6,15 @@ use instant::Instant;
 use warp_terminal::event::ObservedExitStatus;
 
 use crate::ai::agent::AIAgentActionId;
-use crate::ai::agent::conversation::AIConversationId;
 use crate::terminal::model::block::BlockId;
 use crate::terminal::model::session::SessionId;
 
 pub(crate) const MAX_CLOUD_SHELL_RECOVERIES: u8 = 3;
-pub(crate) const CLOUD_SHELL_RECOVERY_GUIDANCE: &str = "This command terminated the persistent cloud shell. Warp started a replacement shell and did not replay the command. Some shell state might be lost. Do not use `exit`, `logout`, `exec`, `kill $$`, or source a script that exits. Run risky exit logic in a subshell, and use the tool result to inspect its exit code. Check the reported restored state and partial side effects before retrying.";
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CloudShellRecoveryDecision {
-    Attempt(u8),
-    Capped,
-    Ineligible,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct CloudShellRecoveryEligibility {
-    pub feature_enabled: bool,
-    pub manual_shutdown_requested: bool,
-    pub recovery_in_progress: bool,
-    pub terminal_failure: bool,
-    pub recovery_count: u8,
-    pub login_shell_bootstrapped: bool,
-    pub third_party_harness: bool,
-    pub shared_ambient_session: bool,
-    pub active_sharer: bool,
-    pub running_environment_setup: bool,
-}
-
-impl CloudShellRecoveryEligibility {
-    pub fn decision(self) -> CloudShellRecoveryDecision {
-        if !self.feature_enabled
-            || self.manual_shutdown_requested
-            || self.recovery_in_progress
-            || self.terminal_failure
-            || !self.login_shell_bootstrapped
-            || self.third_party_harness
-            || !self.shared_ambient_session
-            || !self.active_sharer
-            || self.running_environment_setup
-        {
-            return CloudShellRecoveryDecision::Ineligible;
-        }
-        if self.recovery_count >= MAX_CLOUD_SHELL_RECOVERIES {
-            return CloudShellRecoveryDecision::Capped;
-        }
-        CloudShellRecoveryDecision::Attempt(self.recovery_count + 1)
-    }
-}
+const CLOUD_SHELL_RECOVERY_GUIDANCE: &str = "This command terminated the persistent cloud shell. Warp started a replacement shell and did not replay the command. Some shell state might be lost. Do not use `exit`, `logout`, `exec`, `kill $$`, or source a script that exits. Run risky exit logic in a subshell, and use the tool result to inspect its exit code. Check the reported restored state and partial side effects before retrying.";
 
 #[derive(Debug, Clone)]
 pub struct CloudShellRecoveryRequest {
     pub action_id: AIAgentActionId,
-    pub conversation_id: AIConversationId,
     pub block_id: BlockId,
     pub partial_output: String,
     pub status: ObservedExitStatus,

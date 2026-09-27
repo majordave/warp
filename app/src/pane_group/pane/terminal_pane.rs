@@ -83,10 +83,6 @@ use crate::{
 };
 
 pub type TerminalPaneView = PaneView<TerminalView>;
-type ManagedTerminalSession = (
-    ModelHandle<Box<dyn TerminalManager>>,
-    ViewHandle<TerminalView>,
-);
 
 /// Data kept for terminal panes.
 pub struct TerminalPane {
@@ -199,21 +195,6 @@ impl TerminalPane {
         ctx: &AppContext,
     ) -> ModelHandle<Box<dyn TerminalManager>> {
         self.view.as_ref(ctx).child_data(ctx).clone()
-    }
-
-    fn terminal_session_for_view(
-        &self,
-        terminal_view_id: EntityId,
-        ctx: &AppContext,
-    ) -> Option<ManagedTerminalSession> {
-        self.view
-            .as_ref(ctx)
-            .pane_stack()
-            .as_ref(ctx)
-            .entries()
-            .iter()
-            .find(|(_, view)| view.id() == terminal_view_id)
-            .cloned()
     }
 
     /// Instructs the SQLite thread to delete blocks for this session.
@@ -941,9 +922,17 @@ fn handle_terminal_view_event(
                 ctx.emit(pane_group::Event::ExecuteCommand(event.clone()));
             }
             Event::RecoverCloudShell(request) => {
-                let Some((terminal_manager, terminal_view)) = group
-                    .terminal_session_by_id(pane_id)
-                    .and_then(|pane| pane.terminal_session_for_view(terminal_view_id, ctx))
+                let Some((terminal_manager, terminal_view)) =
+                    group.terminal_session_by_id(pane_id).and_then(|pane| {
+                        pane.view
+                            .as_ref(ctx)
+                            .pane_stack()
+                            .as_ref(ctx)
+                            .entries()
+                            .iter()
+                            .find(|(_, view)| view.id() == terminal_view_id)
+                            .cloned()
+                    })
                 else {
                     return;
                 };

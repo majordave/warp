@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -20,6 +20,9 @@ use pathfinder_geometry::vector::Vector2F;
 use settings::Setting as _;
 use warp_core::SessionId;
 use warp_errors::report_error;
+use warp_terminal::local_tty::docker_sandbox::{
+    DOCKER_SANDBOX_HOME_DIR, DockerSandboxShellStarter,
+};
 use warpui::r#async::Timer;
 use warpui::r#async::executor::Background;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, ViewHandle};
@@ -83,74 +86,21 @@ pub(super) struct ReplaceableEventLoopSender {
     state: Arc<Mutex<EventLoopSenderState>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use std::borrow::Cow;
-
-    use pathfinder_geometry::vector::vec2f;
-    use warpui::units::{IntoPixels as _, Pixels};
-
-    use super::*;
-
-    #[test]
-    fn replacement_sender_queues_resize_and_input_while_suspended() {
-        let (initial_tx, _initial_rx) = mio_channel::channel();
-        let sender = ReplaceableEventLoopSender::new(initial_tx);
-        sender.suspend();
-
-        let size = SizeInfo::new(
-            vec2f(80., 24.),
-            1.0.into_pixels(),
-            1.0.into_pixels(),
-            Pixels::zero(),
-            Pixels::zero(),
-        );
-        sender
-            .send(Message::Resize(size))
-            .expect("resize should queue while recovery is suspended");
-        sender
-            .send(Message::Input(Cow::Borrowed(b"user input")))
-            .expect("input should queue while recovery is suspended");
-
-        let (replacement_tx, replacement_rx) = mio_channel::channel();
-        sender.set_bootstrap_sender(replacement_tx);
-        sender
-            .send_bootstrap(Message::Input(Cow::Borrowed(b"bootstrap")))
-            .expect("bootstrap input should reach the provisional event loop");
-        assert!(matches!(
-            replacement_rx.try_recv(),
-            Ok(Message::Input(bytes)) if &*bytes == b"bootstrap"
-        ));
-        assert!(replacement_rx.try_recv().is_err());
-
-        sender.resume().expect("replacement sender should resume");
-        assert!(matches!(replacement_rx.try_recv(), Ok(Message::Resize(_))));
-        assert!(matches!(
-            replacement_rx.try_recv(),
-            Ok(Message::Input(bytes)) if &*bytes == b"user input"
-        ));
-        assert!(replacement_rx.try_recv().is_err());
-    }
-}
-
 enum EventLoopSenderState {
     Connected(mio_channel::Sender<Message>),
     Suspended {
         bootstrap_sender: Option<mio_channel::Sender<Message>>,
-        pending: VecDeque<Message>,
+        pending: Vec<Message>,
     },
     Disconnected,
 }
 
 fn validated_recovery_working_directory(
-    starter: &warp_terminal::local_tty::docker_sandbox::DockerSandboxShellStarter,
+    starter: &DockerSandboxShellStarter,
     requested: Option<&str>,
 ) -> (String, bool) {
     let Some(requested) = requested.filter(|path| !path.is_empty()) else {
-        return (
-            warp_terminal::local_tty::docker_sandbox::DOCKER_SANDBOX_HOME_DIR.to_owned(),
-            true,
-        );
+        return (DOCKER_SANDBOX_HOME_DIR.to_owned(), true);
     };
     let is_directory = Command::new(starter.logical_shell_path())
         .args([
@@ -166,10 +116,7 @@ fn validated_recovery_working_directory(
     if is_directory {
         (requested.to_owned(), false)
     } else {
-        (
-            warp_terminal::local_tty::docker_sandbox::DOCKER_SANDBOX_HOME_DIR.to_owned(),
-            true,
-        )
+        (DOCKER_SANDBOX_HOME_DIR.to_owned(), true)
     }
 }
 
@@ -183,7 +130,7 @@ impl ReplaceableEventLoopSender {
     fn suspend(&self) {
         *self.state.lock() = EventLoopSenderState::Suspended {
             bootstrap_sender: None,
-            pending: VecDeque::new(),
+            pending: Vec::new(),
         };
     }
 
@@ -223,17 +170,7 @@ impl ReplaceableEventLoopSender {
     }
 
     fn shutdown_current(&self) -> Result<(), EventLoopSendError> {
-        let sender = match &*self.state.lock() {
-            EventLoopSenderState::Connected(sender) => Some(sender.clone()),
-            EventLoopSenderState::Suspended {
-                bootstrap_sender, ..
-            } => bootstrap_sender.clone(),
-            EventLoopSenderState::Disconnected => None,
-        }
-        .ok_or(EventLoopSendError::Disconnected)?;
-        sender
-            .send(Message::Shutdown)
-            .map_err(|_| EventLoopSendError::Disconnected)
+        self.send_bootstrap(Message::Shutdown)
     }
 
     #[cfg(windows)]
@@ -259,7 +196,7 @@ impl EventLoopSender for ReplaceableEventLoopSender {
             match &mut *state {
                 EventLoopSenderState::Connected(sender) => sender.clone(),
                 EventLoopSenderState::Suspended { pending, .. } => {
-                    pending.push_back(message);
+                    pending.push(message);
                     return Ok(());
                 }
                 EventLoopSenderState::Disconnected => {
@@ -409,7 +346,7 @@ struct ShellStartupResources {
 
 #[derive(Clone)]
 struct ShellRecoveryResources {
-    starter: warp_terminal::local_tty::docker_sandbox::DockerSandboxShellStarter,
+    starter: DockerSandboxShellStarter,
     original_env: HashMap<OsString, OsString>,
     channel_event_proxy: ChannelEventListener,
     #[cfg(unix)]
@@ -421,7 +358,6 @@ struct PendingShellRecovery {
     restored_working_directory: String,
     used_fallback_directory: bool,
     replacement_session_id: SessionId,
-    event_loop_tx: mio_channel::Sender<Message>,
 }
 
 /// Handles created for a local terminal manager and its surface.
@@ -846,9 +782,6 @@ impl<S> TerminalManager<S> {
         let Some(resources) = self.recovery_resources.clone() else {
             return false;
         };
-        if self.pending_shell_recovery.is_some() {
-            return false;
-        }
 
         self.event_loop_tx.suspend();
         if let Some(event_loop_handle) = self.event_loop_handle.take()
@@ -924,13 +857,12 @@ impl<S> TerminalManager<S> {
             resources.channel_event_proxy,
         ));
         self.event_loop_tx
-            .set_bootstrap_sender(replacement_event_loop_tx.clone());
+            .set_bootstrap_sender(replacement_event_loop_tx);
         self.pending_shell_recovery = Some(PendingShellRecovery {
             request,
             restored_working_directory,
             used_fallback_directory,
             replacement_session_id,
-            event_loop_tx: replacement_event_loop_tx,
         });
 
         self.view.update(ctx, |surface, ctx| {
@@ -954,15 +886,18 @@ impl<S> TerminalManager<S> {
             async {
                 Timer::after(Duration::from_secs(15)).await;
             },
-            |manager, _, ctx| {
+            move |manager, _, ctx| {
                 let Some(manager) = manager.as_any_mut().downcast_mut::<Self>() else {
                     return;
                 };
-                let Some(pending) = manager.pending_shell_recovery.take() else {
+                let Some(pending) = manager
+                    .pending_shell_recovery
+                    .take_if(|pending| pending.replacement_session_id == replacement_session_id)
+                else {
                     return;
                 };
+                let _ = manager.event_loop_tx.shutdown_current();
                 manager.event_loop_tx.disconnect();
-                let _ = pending.event_loop_tx.send(Message::Shutdown);
                 manager.view.update(ctx, |surface, ctx| {
                     surface.on_cloud_shell_recovery_failed(
                         pending.request,
@@ -984,13 +919,12 @@ impl<S> TerminalManager<S> {
         S: TerminalSurface,
         <S as Entity>::Event: PtyIntentEvent,
     {
-        let Some(pending) = self.pending_shell_recovery.take() else {
+        let Some(pending) = self
+            .pending_shell_recovery
+            .take_if(|pending| pending.replacement_session_id == session_id)
+        else {
             return;
         };
-        if pending.replacement_session_id != session_id {
-            self.pending_shell_recovery = Some(pending);
-            return;
-        }
 
         if let Err(error) = self.event_loop_tx.resume() {
             self.fail_pending_shell_recovery(
@@ -1516,3 +1450,7 @@ impl EventLoopSender for mio_channel::Sender<Message> {
             .map_err(|_| EventLoopSendError::Disconnected)
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_manager_tests.rs"]
+mod tests;
