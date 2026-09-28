@@ -2298,9 +2298,8 @@ impl AgentDriver {
                         .spawn(|_, ctx| ServerApiProvider::as_ref(ctx).get_managed_mcp_client())
                         .await?;
                     let mcp_startup_result = setup_events
-                        .record_shared_result(
-                            SetupStep::McpServerStartup,
-                            SetupStep::ProfileMcpServerStartup,
+                        .record_result(
+                            SetupStep::ConfiguredMcpServerStartup,
                             Self::start_task_and_profile_mcp_servers(
                                 &task.mcp_specs,
                                 managed_mcp_client,

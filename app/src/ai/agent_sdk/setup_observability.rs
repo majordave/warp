@@ -66,42 +66,6 @@ impl SetupClientEventReporter {
         result
     }
 
-    pub(crate) async fn record_shared_result<T, E: std::error::Error>(
-        &self,
-        first_step: SetupStep,
-        second_step: SetupStep,
-        future: impl Future<Output = Result<T, E>>,
-    ) -> Result<T, E> {
-        let (first_step_name, first_span) = first_step.to_event_name_and_span();
-        let (second_step_name, second_span) = second_step.to_event_name_and_span();
-
-        let start_timestamp = Utc::now();
-        let result = future
-            .map(|result| {
-                result.inspect_err(|err| {
-                    tracing::error!(error = %err);
-                })
-            })
-            .instrument(first_span)
-            .instrument(second_span)
-            .await;
-        let finish_timestamp = Utc::now();
-        let is_error = result.is_err();
-
-        self.post_setup_metric_event_best_effort(
-            first_step_name,
-            start_timestamp,
-            finish_timestamp,
-            is_error,
-        );
-        self.post_setup_metric_event_best_effort(
-            second_step_name,
-            start_timestamp,
-            finish_timestamp,
-            is_error,
-        );
-        result
-    }
     pub(crate) async fn record_value<T>(
         &self,
         step: SetupStep,
@@ -222,9 +186,8 @@ pub(crate) enum SetupStep {
     SkillRepoClone,
     TerminalBootstrap,
     CloudProviderSetup,
-    McpServerStartup,
+    ConfiguredMcpServerStartup,
     AgentProfileConfiguration,
-    ProfileMcpServerStartup,
     SharedSessionEstablishment,
     GlobalSkillResolution,
     GlobalSkillRepoClone,
@@ -280,14 +243,11 @@ impl SetupStep {
             Self::CloudProviderSetup => {
                 span_and_name!("setup_cloud_provider_setup")
             }
-            Self::McpServerStartup => {
-                span_and_name!("setup_mcp_server_startup")
+            Self::ConfiguredMcpServerStartup => {
+                span_and_name!("setup_configured_mcp_server_startup")
             }
             Self::AgentProfileConfiguration => {
                 span_and_name!("setup_agent_profile_configuration")
-            }
-            Self::ProfileMcpServerStartup => {
-                span_and_name!("setup_profile_mcp_server_startup")
             }
             Self::SharedSessionEstablishment => {
                 span_and_name!("setup_shared_session_establishment")
