@@ -965,8 +965,15 @@ impl ApiKeyManager {
     pub fn set_aws_credentials_refresh_strategy(
         &mut self,
         strategy: AwsCredentialsRefreshStrategy,
+        ctx: &mut ModelContext<Self>,
     ) {
+        let changed_to_oidc = self.aws_credentials_refresh_strategy != strategy
+            && matches!(&strategy, AwsCredentialsRefreshStrategy::OidcManaged { .. });
         self.aws_credentials_refresh_strategy = strategy;
+        if changed_to_oidc {
+            // The local chain can load the pod's runtime role before the task's Bedrock role is known.
+            self.set_aws_credentials_state(AwsCredentialsState::Missing, ctx);
+        }
     }
 
     /// Builds the `CustomModelProviders` registry that ships with every agent request.

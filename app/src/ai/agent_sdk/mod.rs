@@ -826,6 +826,7 @@ impl AgentDriverRunner {
                                     role_arn,
                                     region: role_region,
                                 },
+                                ctx,
                             );
                             refresh_aws_credentials(manager, ctx)
                         })
